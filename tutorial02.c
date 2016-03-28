@@ -15,6 +15,9 @@
 // to build (assuming libavformat and libavcodec are correctly installed, 
 // and assuming you have sdl-config. Please refer to SDL docs for your installation.)
 //
+// build on mac with:
+// gcc -o tutorial02 tutorial02.c -lavutil -lavformat -lavcodec -lswscale -lz -lm -I/Library/Frameworks/SDL2.framework/Headers -framework SDL2
+//
 // Run using
 // tutorial02 myvideofile.mpg
 //
@@ -23,6 +26,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
 
 #include <SDL.h>
 #include <SDL_thread.h>
@@ -32,6 +36,9 @@
 #endif
 
 #include <stdio.h>
+
+#define USE_FFMPEG_SWS 0
+
 
 // compatibility with newer API
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(55,28,1)
@@ -46,13 +53,19 @@ int main(int argc, char *argv[]) {
   AVCodecContext  *pCodecCtx = NULL;
   AVCodec         *pCodec = NULL;
   AVFrame         *pFrame = NULL;
+  AVFrame         *pFrameYUV = NULL;
   AVPacket        packet;
   int             frameFinished;
+  int             numBytes;
+  uint8_t         *buffer = NULL;
   float           aspect_ratio;
+#if USE_FFMPEG_SWS
   struct SwsContext *sws_ctx = NULL;
+#endif
 
-  SDL_Overlay     *bmp;
-  SDL_Surface     *screen;
+  SDL_Window      *wnd;
+  SDL_Renderer    *renderer;
+  SDL_Texture     *bmp;
   SDL_Rect        rect;
   SDL_Event       event;
 
@@ -113,36 +126,48 @@ int main(int argc, char *argv[]) {
   pFrame=av_frame_alloc();
 
   // Make a screen to put our video
-#ifndef __DARWIN__
-        screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 0, 0);
-#else
-        screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 24, 0);
-#endif
-  if(!screen) {
+  wnd = SDL_CreateWindow("ffmpeg-tutorial02",
+    SDL_WINDOWPOS_UNDEFINED,
+    SDL_WINDOWPOS_UNDEFINED, 
+    pCodecCtx->width, pCodecCtx->height,
+    0);
+
+  if(!wnd) {
     fprintf(stderr, "SDL: could not set video mode - exiting\n");
     exit(1);
   }
+
+  renderer = SDL_CreateRenderer(wnd, -1, 0);
   
   // Allocate a place to put our YUV image on that screen
-  bmp = SDL_CreateYUVOverlay(pCodecCtx->width,
-				 pCodecCtx->height,
-				 SDL_YV12_OVERLAY,
-				 screen);
+  bmp = SDL_CreateTexture(renderer, 
+    SDL_PIXELFORMAT_YV12, 
+    SDL_TEXTUREACCESS_STATIC, 
+    pCodecCtx->width, 
+    pCodecCtx->height);  
 
+  pFrameYUV = av_frame_alloc();
+
+  // Determine required buffer size and allocate buffer
+  numBytes=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height, 1);
+  buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
+
+  av_image_fill_arrays(pFrameYUV->data, pFrameYUV->linesize, buffer, 
+    AV_PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height, 1);
+
+#if USE_FFMPEG_SWS
   // initialize SWS context for software scaling
   sws_ctx = sws_getContext(pCodecCtx->width,
 			   pCodecCtx->height,
 			   pCodecCtx->pix_fmt,
 			   pCodecCtx->width,
 			   pCodecCtx->height,
-			   PIX_FMT_YUV420P,
+			   AV_PIX_FMT_YUV420P,
 			   SWS_BILINEAR,
 			   NULL,
 			   NULL,
-			   NULL
-			   );
-
-
+			   NULL);
+#endif
 
   // Read frames and save first five frames to disk
   i=0;
@@ -154,35 +179,35 @@ int main(int argc, char *argv[]) {
       
       // Did we get a video frame?
       if(frameFinished) {
-	SDL_LockYUVOverlay(bmp);
 
-	AVPicture pict;
-	pict.data[0] = bmp->pixels[0];
-	pict.data[1] = bmp->pixels[2];
-	pict.data[2] = bmp->pixels[1];
+#if USE_FFMPEG_SWS
+      	// Convert the image into YUV format that SDL uses
+      	sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
+      		  pFrame->linesize, 0, pCodecCtx->height,
+      		  pFrameYUV->data, pFrameYUV->linesize);
+#endif
 
-	pict.linesize[0] = bmp->pitches[0];
-	pict.linesize[1] = bmp->pitches[2];
-	pict.linesize[2] = bmp->pitches[1];
+        //SDL_UpdateTexture(bmp, NULL, pFrame->data, numBytes / pCodecCtx->height);
+        SDL_UpdateYUVTexture(bmp, NULL, 
+#if USE_FFMPEG_SWS
+          pFrameYUV->data[0], pFrameYUV->linesize[0], 
+          pFrameYUV->data[1], pFrameYUV->linesize[1], 
+          pFrameYUV->data[2], pFrameYUV->linesize[2]);
+#else
+          pFrame->data[0], pFrame->linesize[0], 
+          pFrame->data[1], pFrame->linesize[1], 
+          pFrame->data[2], pFrame->linesize[2]);
+#endif
+        SDL_RenderClear(renderer);
+        SDL_RenderCopy(renderer, bmp, NULL, NULL);
 
-	// Convert the image into YUV format that SDL uses
-	sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
-		  pFrame->linesize, 0, pCodecCtx->height,
-		  pict.data, pict.linesize);
-
-	SDL_UnlockYUVOverlay(bmp);
-	
-	rect.x = 0;
-	rect.y = 0;
-	rect.w = pCodecCtx->width;
-	rect.h = pCodecCtx->height;
-	SDL_DisplayYUVOverlay(bmp, &rect);
+        SDL_RenderPresent(renderer);
       
       }
     }
     
     // Free the packet that was allocated by av_read_frame
-    av_free_packet(&packet);
+    av_packet_unref(&packet);
     SDL_PollEvent(&event);
     switch(event.type) {
     case SDL_QUIT:
